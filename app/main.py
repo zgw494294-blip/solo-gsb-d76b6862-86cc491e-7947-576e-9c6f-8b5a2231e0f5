@@ -18,6 +18,7 @@ from .isolation import (
     create_job,
     get_snapshot,
     revise_demands,
+    terminate_job,
     toggle_pipe,
 )
 from .solver import (
@@ -195,6 +196,24 @@ async def read_isolation_job(job_id: str) -> JSONResponse:
     except JobNotFoundError as exc:
         return _isolation_error(exc)
     return JSONResponse(content={"ok": True, "job": snapshot})
+
+
+@app.delete("/api/isolation-jobs/{job_id}")
+async def terminate_isolation_job(job_id: str) -> JSONResponse:
+    """结束不再使用的隔离作业并从内存注册表移除。
+
+    无需请求体与 version，不重启服务、不等待也不中断正在进行的底层数值
+    计算：正在求解也立即结束。成功返回被移除的 job_id；未知编号或重复结束
+    返回 404。结束成功后，该作业新发起的读取、切换与需水量修订全部 404；
+    结束时尚未提交的迟到操作（无论之后算成还是触发失供/欠压/不收敛/非有限
+    数错误）同样一律 404，不能再提交、成功或恢复作业；结束前已成功提交的
+    操作保持原返回语义。其他作业与健康检查不受影响。
+    """
+    try:
+        removed_id = terminate_job(job_id)
+    except JobNotFoundError as exc:
+        return _isolation_error(exc)
+    return JSONResponse(content={"ok": True, "job_id": removed_id})
 
 
 @app.post("/api/isolation-jobs/{job_id}/toggle")
