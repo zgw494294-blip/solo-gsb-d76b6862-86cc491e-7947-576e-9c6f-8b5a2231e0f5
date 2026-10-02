@@ -1,4 +1,4 @@
-"""FastAPI 入口：/api/solve 等求解接口、/api/isolation-jobs 停管隔离作业接口，其余路径提供原生前端静态页面。"""
+"""FastAPI 入口：/api/solve 等求解接口、/api/isolation-jobs 停管隔离作业接口（含 DELETE 结束作业），其余路径提供原生前端静态页面。"""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from .isolation import (
     create_job,
     get_snapshot,
     revise_demands,
+    terminate_job,
     toggle_pipe,
 )
 from .solver import (
@@ -252,6 +253,23 @@ async def revise_isolation_demands(job_id: str, request: Request) -> JSONRespons
         "revised_demands": updates,
         "job": snapshot,
     })
+
+
+@app.delete("/api/isolation-jobs/{job_id}")
+async def terminate_isolation_job(job_id: str) -> JSONResponse:
+    """结束不再使用的停管隔离作业：无需请求体与版本号，成功返回该作业 ID。
+
+    结束立即生效、不等待也不中断正在进行的底层数值计算：作业从内存注册表
+    摘除后，新发起的读取、切换与需水量修订一律 404；结束时尚未提交的在途
+    操作无论之后算成还是触发失供/欠压/不收敛/非有限数错误，到达提交点时
+    同样按 404 放弃，不能再提交、返回成功或恢复作业。未知 ID 与重复结束
+    均返回 404；其他作业与健康检查不受影响。
+    """
+    try:
+        removed_id = terminate_job(job_id)
+    except JobNotFoundError as exc:
+        return _isolation_error(exc)
+    return JSONResponse(content={"ok": True, "terminated_job": removed_id})
 
 
 # 静态资源（index.html / style.css / app.js）——该路由必须最后注册

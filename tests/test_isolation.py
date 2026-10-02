@@ -10,7 +10,13 @@
 读取快照一致性、
 404/400/422 分支，以及计算期间的 HTTP 并发顺序（可暂停求解门：健康检查/
 读取/其他作业不阻塞、后来的操作先提交、迟到者 409 且旧计算不覆盖新需水量、
-失败后同版本重试）。
+失败后同版本重试）。结束作业部分覆盖：结束成功返回该 ID 且无需 version、
+未知 ID 与重复结束 404、求解进行中也能立即结束（不等待底层计算）、结束后
+新发起的读取/切换/修订与重复结束全部 404（不能再提交、成功或恢复作业）、
+结束时尚未提交的在途操作之后无论算成还是触发失供/欠压/不收敛/非有限数
+错误都按 404 放弃、结束前已提交（含先提交成功与迟到 409）的操作保持原
+返回语义，以及其他作业与健康检查不受影响——结束与迟到操作的先后顺序同样
+用可暂停求解门在真实 Uvicorn 进程上确定。
 """
 
 from __future__ import annotations
@@ -1511,3 +1517,358 @@ def test_http_concurrency_failing_revise_keeps_state_then_retry(
     assert resp.status_code == 200
     assert resp.json()["job"]["version"] == 1
     assert resp.json()["job"]["demands"][0]["demand"] == 1.0
+
+
+# ---------------------------- 结束作业 ---------------------------- #
+def _delete(job_id: str):
+    return client.delete(f"/api/isolation-jobs/{job_id}")
+
+
+def test_terminate_job_returns_id_without_version():
+    """结束无需请求体与 version：200 返回该作业 ID；结束前读取保持正常。"""
+    job = _create(_tree_payload())
+    jid = job["job_id"]
+    assert _get(jid)["version"] == 0
+    resp = _delete(jid)  # 不传 version、不带请求体
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data == {"ok": True, "terminated_job": jid}
+
+
+def test_terminate_then_all_reads_toggles_revises_are_404():
+    """结束后新发起的读取、切换与需水量修订全部 404，不能再提交或成功。"""
+    p = _tree_payload()
+    p["allow_unserved"] = ["B"]
+    job = _create(p)
+    jid = job["job_id"]
+    assert _delete(jid).status_code == 200
+
+    assert client.get(f"/api/isolation-jobs/{jid}").status_code == 404
+    assert _toggle(jid, 0, "P2").status_code == 404
+    assert _revise(jid, 0, [{"node_id": "A", "demand": 1.0}]).status_code == 404
+    # 带非法 version 的切换同样 404（结束语义优先于参数校验）
+    assert client.post(f"/api/isolation-jobs/{jid}/toggle",
+                       json={"version": "bad", "pipe_id": "P2"}
+                       ).status_code == 404
+    # 404 响应沿用原“作业不存在”文案
+    assert "不存在" in _toggle(jid, 0, "P2").json()["error"]
+
+
+def test_terminate_unknown_and_repeat_termination_are_404():
+    """未知 ID 与重复结束都返回 404；ID 不会被同 ID 操作恢复。"""
+    resp = _delete("does-not-exist")
+    assert resp.status_code == 404
+    assert "不存在" in resp.json()["error"]
+
+    job = _create(_tree_payload())
+    jid = job["job_id"]
+    assert _delete(jid).status_code == 200
+    assert _delete(jid).status_code == 404  # 重复结束
+    assert _delete(jid).status_code == 404
+    # 结束后任何操作都不能让作业复活
+    assert client.get(f"/api/isolation-jobs/{jid}").status_code == 404
+
+
+def test_terminate_terminated_id_not_resurrected_by_new_create():
+    """结束后新建作业只产生新 ID；旧 ID 永远 404。"""
+    job = _create(_tree_payload())
+    jid = job["job_id"]
+    assert _delete(jid).status_code == 200
+    new_job = _create(_tree_payload())
+    assert new_job["job_id"] != jid
+    assert client.get(f"/api/isolation-jobs/{jid}").status_code == 404
+    assert _get(new_job["job_id"])["version"] == 0
+
+
+def test_terminate_does_not_affect_other_jobs_or_health():
+    """结束一个作业：其他作业仍遵守原语义，健康检查照常响应。"""
+    job_a = _create(_tree_payload())
+    job_b = _create(_loop_payload())
+    assert _delete(job_a["job_id"]).status_code == 200
+    # A 已 404，B 仍可读取、切换、修订
+    assert client.get(f"/api/isolation-jobs/{job_a['job_id']}").status_code == 404
+    got_b = _get(job_b["job_id"])
+    assert got_b["version"] == 0 and got_b["closed_pipes"] == []
+    assert _toggle(job_b["job_id"], 0, "P3").status_code == 200
+    assert _revise(job_b["job_id"], 1, [{"node_id": "A", "demand": 0.5}]
+                   ).status_code == 200
+    got_b = _get(job_b["job_id"])
+    assert got_b["version"] == 2 and got_b["closed_pipes"] == ["P3"]
+    # 结束 B 不影响 A 的 404，也不影响健康检查
+    assert _delete(job_b["job_id"]).status_code == 200
+    assert client.get("/api/health").status_code == 200
+    assert client.get(f"/api/isolation-jobs/{job_b['job_id']}").status_code == 404
+
+
+def test_terminate_while_operations_succeed_keeps_other_version_rules():
+    """未结束作业继续遵守版本冲突：结束隔壁作业不改变其 409/200 语义。"""
+    job_a = _create(_loop_payload())
+    job_b = _create(_tree_payload())
+    assert _delete(job_b["job_id"]).status_code == 200
+    assert _toggle(job_a["job_id"], 0, "P3").status_code == 200  # v0 -> v1
+    resp = _toggle(job_a["job_id"], 0, "P3")  # 旧版本
+    assert resp.status_code == 409 and resp.json()["current_version"] == 1
+    assert _get(job_a["job_id"])["version"] == 1
+
+
+# -------------- 结束与迟到操作的先后顺序（真实 HTTP + 可暂停求解门） -------------- #
+def _delete_on(http, job_id):
+    return http.delete(f"/api/isolation-jobs/{job_id}")
+
+
+def test_http_terminate_during_paused_compute_late_success_becomes_404(
+        server, monkeypatch):
+    """作业求解被暂停时结束：DELETE 立即返回，放行后原本会成功的在途切换收 404。
+
+    同时核对：结束不等待也不中断底层计算；暂停期间健康检查与其他作业照常；
+    结束后新发起的读取/切换/修订与重复结束全部 404；底层线程放行后作业不
+    复活，且不影响其他作业。
+    """
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create_on(server, p)
+    jid = job["job_id"]
+    other = _create_on(server, _loop_payload())
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P1"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    # v0 关 P1（连通区仅剩水源，本会成功）——重算被暂停
+    t_toggle, res_toggle = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P1"})
+    assert gate.arrived.wait(timeout=5)
+
+    # 计算仍在进行：健康检查与其他作业立即响应；本作业读取仍是已提交的 v0
+    assert server.get("/api/health").status_code == 200
+    assert server.get(f"/api/isolation-jobs/{jid}").json()["job"]["version"] == 0
+    other_resp = _toggle_on(server, other["job_id"], 0, "P3")
+    assert other_resp.status_code == 200 and other_resp.json()["job"]["version"] == 1
+
+    # 结束立即返回（不等待被暂停的计算），无需 version
+    resp_del = _delete_on(server, jid)
+    assert resp_del.status_code == 200
+    assert resp_del.json() == {"ok": True, "terminated_job": jid}
+
+    # 结束后新发起的读取/切换/修订/重复结束全部 404（此时计算线程仍被门暂停）
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+    assert _toggle_on(server, jid, 0, "P2").status_code == 404
+    assert _revise_on(server, jid, 0, [{"node_id": "A", "demand": 1.0}]
+                      ).status_code == 404
+    assert _delete_on(server, jid).status_code == 404
+
+    # 放行了在途的“本会成功”的切换：到达提交点发现已结束 -> 404，绝不提交
+    gate.released.set()
+    t_toggle.join(timeout=5)
+    assert not t_toggle.is_alive()
+    assert "error" not in res_toggle, res_toggle.get("error")
+    resp_late = res_toggle["response"]
+    assert resp_late.status_code == 404
+    assert "不存在" in resp_late.json()["error"]
+
+    # 底层计算结束后作业没有复活
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+    assert _toggle_on(server, jid, 0, "P1").status_code == 404
+    assert _revise_on(server, jid, 0, [{"node_id": "A", "demand": 1.0}]
+                      ).status_code == 404
+    assert _delete_on(server, jid).status_code == 404
+    # 其他作业全程不受影响
+    final_other = server.get(
+        f"/api/isolation-jobs/{other['job_id']}").json()["job"]
+    assert final_other["version"] == 1 and final_other["closed_pipes"] == ["P3"]
+    assert server.get("/api/health").status_code == 200
+
+
+def test_http_terminate_paused_unserved_failure_returns_404_not_422(
+        server, monkeypatch):
+    """结束时尚未提交的切换，放行后触发失供规则：返回 404 而非 422。"""
+    p = _tree_payload()
+    p["allow_unserved"] = ["B"]  # 关 P1 会让 A 失供（不允许）
+    job = _create_on(server, p)
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P1"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_bad, res_bad = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P1"})
+    assert gate.arrived.wait(timeout=5)
+    assert _delete_on(server, jid).status_code == 200
+
+    gate.released.set()
+    t_bad.join(timeout=5)
+    resp = res_bad["response"]
+    assert resp.status_code == 404  # 不是 422：结束优先
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+    assert _toggle_on(server, jid, 0, "P2").status_code == 404
+
+
+def test_http_terminate_paused_under_pressure_returns_404_not_422(
+        server, monkeypatch):
+    """结束时尚未提交的切换，放行后触发欠压：返回 404 而非 422。"""
+    job = _create_on(server, _loop_payload())  # 关 P1 后 B 欠压
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P1"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_bad, res_bad = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P1"})
+    assert gate.arrived.wait(timeout=5)
+    assert _delete_on(server, jid).status_code == 200
+
+    gate.released.set()
+    t_bad.join(timeout=5)
+    assert res_bad["response"].status_code == 404
+    # 健康检查始终可响应
+    assert server.get("/api/health").status_code == 200
+
+
+def test_http_terminate_paused_not_converged_returns_404_not_422(
+        server, monkeypatch):
+    """结束时尚未提交的切换，放行后求解不收敛：返回 404 而非 422。"""
+    real_solve = iso.solve_network
+    calls = {"n": 0}
+
+    def flaky(net):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # 第 1 次为创建时的初始求解
+            raise SolverNotConverged("模拟切换后不收敛")
+        return real_solve(net)
+
+    monkeypatch.setattr(iso, "solve_network", flaky)
+    job = _create_on(server, _loop_payload())
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P3"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_bad, res_bad = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P3"})
+    assert gate.arrived.wait(timeout=5)
+    assert _delete_on(server, jid).status_code == 200
+
+    gate.released.set()
+    t_bad.join(timeout=5)
+    assert res_bad["response"].status_code == 404
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+
+
+def test_http_terminate_paused_revise_success_and_failure_both_404(
+        server, monkeypatch):
+    """结束时尚未提交的修订：放行后无论算成还是欠压，都返回 404。"""
+    # 情形一：修订本会成功（A 2->3，供水量 6）
+    job = _create_on(server, _tree_payload())
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="revise", closed=frozenset())
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_ok, res_ok = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/demands",
+        {"version": 0, "demands": [{"node_id": "A", "demand": 3.0}]})
+    assert gate.arrived.wait(timeout=5)
+    assert _delete_on(server, jid).status_code == 200
+    gate.released.set()
+    t_ok.join(timeout=5)
+    assert res_ok["response"].status_code == 404
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+
+    # 情形二：修订本会欠压失败（A=100）——同样 404 而非 422
+    job2 = _create_on(server, _tree_payload())
+    jid2 = job2["job_id"]
+    gate2 = _PausableCompute(job_id=jid2, stage="revise", closed=frozenset())
+    iso._COMPUTE_GATE = gate2
+    t_bad, res_bad = _post_async_on(
+        server, f"/api/isolation-jobs/{jid2}/demands",
+        {"version": 0, "demands": [{"node_id": "A", "demand": 100.0}]})
+    assert gate2.arrived.wait(timeout=5)
+    assert _delete_on(server, jid2).status_code == 200
+    gate2.released.set()
+    t_bad.join(timeout=5)
+    assert res_bad["response"].status_code == 404
+    assert _revise_on(server, jid2, 0, [{"node_id": "A", "demand": 1.0}]
+                      ).status_code == 404
+
+
+def test_http_terminate_paused_overflow_revise_returns_404_not_422(
+        server, monkeypatch):
+    """结束时尚未提交的修订，放行后触发失供总量聚合溢出：404 而非 422。"""
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create_on(server, p)
+    jid = job["job_id"]
+    assert _toggle_on(server, jid, 0, "P1").status_code == 200  # A、B 全失供
+    gate = _PausableCompute(job_id=jid, stage="revise", closed=frozenset({"P1"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    big = 1e308
+    t_bad, res_bad = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/demands",
+        {"version": 1, "demands": [
+            {"node_id": "A", "demand": big}, {"node_id": "B", "demand": big}]})
+    assert gate.arrived.wait(timeout=5)
+    assert _delete_on(server, jid).status_code == 200
+
+    gate.released.set()
+    t_bad.join(timeout=5)
+    assert res_bad["response"].status_code == 404  # 本应 422 的溢出失败也变 404
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+
+
+def test_http_committed_before_terminate_keeps_original_semantics(
+        server, monkeypatch):
+    """结束前已提交的操作保持原返回语义：先提交者 200、迟到者 409；结束后才 404。"""
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create_on(server, p)
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P2"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    # 先发起的 P2 切换被暂停
+    t_p2, res_p2 = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P2"})
+    assert gate.arrived.wait(timeout=5)
+
+    # P1 在结束之前先算完先提交：v0 -> v1（结束前已提交，必须 200）
+    resp_p1 = _toggle_on(server, jid, 0, "P1")
+    assert resp_p1.status_code == 200
+    assert resp_p1.json()["job"]["version"] == 1
+    assert resp_p1.json()["job"]["closed_pipes"] == ["P1"]
+
+    # 此时结束作业
+    assert _delete_on(server, jid).status_code == 200
+
+    # 放行被暂停的 P2：它在结束时仍未提交 -> 404（而不是结束前语义下的 409）
+    gate.released.set()
+    t_p2.join(timeout=5)
+    assert res_p2["response"].status_code == 404
+
+    # 结束后一切皆 404，P1 提交的状态也不再可读
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+    assert _toggle_on(server, jid, 1, "P2").status_code == 404
+    assert _delete_on(server, jid).status_code == 404
+
+
+def test_http_terminate_during_paused_revise_stale_version_then_404(
+        server, monkeypatch):
+    """结束时未提交的修订：即便其基态版本已被并发推进，放行后仍是 404（非 409）。"""
+    job = _create_on(server, _tree_payload())
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="revise", closed=frozenset())
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_slow, res_slow = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/demands",
+        {"version": 0, "demands": [{"node_id": "A", "demand": 3.0}]})
+    assert gate.arrived.wait(timeout=5)
+    # 结束前另一修订先提交成功：v0 -> v1
+    resp_fast = _revise_on(server, jid, 0, [{"node_id": "A", "demand": 0.0}])
+    assert resp_fast.status_code == 200 and resp_fast.json()["job"]["version"] == 1
+    # 然后结束：慢修订提交时版本已旧且作业已终止，终止优先 -> 404
+    assert _delete_on(server, jid).status_code == 200
+
+    gate.released.set()
+    t_slow.join(timeout=5)
+    assert res_slow["response"].status_code == 404
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404

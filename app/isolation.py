@@ -25,6 +25,14 @@
 修订与管段切换合计最多成功一次；读取始终返回某一版本的完整快照，绝不混合
 不同版本的数据。
 
+``terminate_job`` 结束不再使用的作业：无需重启服务、无需请求体与版本号，
+成功即把作业从注册表移除并返回该 ID，未知 ID 或重复结束按 404 处理。结束不
+中断底层数值计算，也不等待进行中的计算：作业被打上终止标记并摘除后，新发起
+的读取、切换与修订一律 404；结束时尚未提交的切换或修订（无论之后算出结果、
+触发欠压/不收敛/非有限数错误，还是其基态版本已被并发推进）在到达提交点时
+发现标记，全部按 404 结束，不能再提交、不能返回成功、也不会恢复作业。结束
+前已经完成提交的操作保持原有返回语义。其他作业与健康检查不受影响。
+
 耗时的连通区重算与稳态求解在作业锁之外进行，因此计算期间健康检查、已提交
 快照的读取以及其他作业的操作都不会被阻塞；同一作业也允许后来的切换先算完
 并先提交。临界区只在提交瞬间持有：提交时重新比对版本，版本已被后来者推进
@@ -89,6 +97,10 @@ class _IsolationJob:
     version: int
     snapshot: dict[str, Any]
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # 结束标记：置位后作业已从注册表摘除（新发起的读取/切换/修订直接 404）；
+    # 结束时尚未提交、仍在锁外重算的操作到达提交点时据此放弃结果，无论成功
+    # 还是规则失败都按 404 处理，绝不提交、成功或恢复作业。
+    terminated: bool = False
 
 
 # 作业注册表：仅存于单进程内存，服务重启即清空
@@ -413,7 +425,7 @@ def _build_snapshot(job_id: str, version: int, net: Network,
 
 
 # --------------------------------------------------------------------------- #
-# 作业生命周期：创建 / 读取 / 切换 / 修订需水量
+# 作业生命周期：创建 / 读取 / 切换 / 修订需水量 / 结束
 # --------------------------------------------------------------------------- #
 def create_job(payload: Any) -> dict[str, Any]:
     """创建停管隔离作业，返回版本 0 的初始快照。
@@ -444,14 +456,36 @@ def get_snapshot(job_id: str) -> dict[str, Any]:
     """读取作业最近一次成功提交的完整快照（快照为不可变整体，绝不混合不同版本的数据）。
 
     即使该作业此刻正在重算，本函数也只短暂加锁后立即返回最近已提交的快照，
-    不会等待进行中的计算。
+    不会等待进行中的计算。作业已被结束（注册表中不再存在，或摘除与终止标记
+    之间的瞬间仍被已摘除对象上的迟到读取命中）时抛 JobNotFoundError。
     """
     with _REGISTRY_LOCK:
         job = _JOBS.get(job_id)
     if job is None:
         raise JobNotFoundError(job_id)
     with job.lock:
+        if job.terminated:
+            raise JobNotFoundError(job_id)
         return job.snapshot
+
+
+def terminate_job(job_id: str) -> str:
+    """结束不再使用的作业：从注册表摘除并打上终止标记，返回作业 ID。
+
+    不要求也不携带版本号；未知 ID 与重复结束（第二次起作业已不在注册表）
+    一律抛 JobNotFoundError（HTTP 层映射为 404）。不中断底层数值计算、也不
+    等待任何进行中的重算：先在注册表锁内把作业摘出（此后新发起的读取、切换
+    与修订都因注册表查无此作业而 404，且该步骤不与计算锁嵌套、不会等待
+    计算线程），再短暂获取作业锁置位终止标记，保证结束请求返回后任何到达
+    提交点的在途操作都能观察到标记并放弃结果。
+    """
+    with _REGISTRY_LOCK:
+        job = _JOBS.pop(job_id, None)
+    if job is None:
+        raise JobNotFoundError(job_id)
+    with job.lock:
+        job.terminated = True
+    return job_id
 
 
 def toggle_pipe(job_id: str, payload: Any) -> dict[str, Any]:
@@ -482,6 +516,8 @@ def toggle_pipe(job_id: str, payload: Any) -> dict[str, Any]:
 
     # 第 1 段临界区：仅做输入归属核对与基态快照，立即释放，不带着锁做重算
     with job.lock:
+        if job.terminated:
+            raise JobNotFoundError(job_id)
         if version != job.version:
             raise VersionConflictError(version, job.version)
         if pipe_id not in {p["id"] for p in job.network.pipes}:
@@ -494,11 +530,22 @@ def toggle_pipe(job_id: str, payload: Any) -> dict[str, Any]:
 
     new_closed = base_closed ^ {pipe_id}  # 开→关 或 关→开
     # 锁外重算：其他请求（健康检查、读取、其他作业、后来的操作）在此期间照常返回
-    candidate = _build_snapshot(job.job_id, base_version + 1, net,
-                                allowed, new_closed, stage="toggle")
+    try:
+        candidate = _build_snapshot(job.job_id, base_version + 1, net,
+                                    allowed, new_closed, stage="toggle")
+    except IsolationRuleError:
+        # 重算期间作业可能已被结束：结束时本次操作尚未提交，结束后无论
+        # 算出什么失败（失供/欠压/不收敛/非有限数）都统一按 404 处理，
+        # 绝不返回 422，更不会恢复作业。
+        with job.lock:
+            if job.terminated:
+                raise JobNotFoundError(job_id) from None
+        raise
 
     # 第 2 段临界区：提交时重新比对版本——计算期间版本若已推进则丢弃本次结果
     with job.lock:
+        if job.terminated:
+            raise JobNotFoundError(job_id)
         if job.version != base_version:
             raise VersionConflictError(version, job.version)
         # 全部规则满足且求解收敛：一次性提交关闭集合、版本号与稳态结果
@@ -535,6 +582,8 @@ def revise_demands(job_id: str, payload: Any) -> tuple[dict[str, Any], list[dict
     # 第 1 段临界区：版本比对、归属核对与基态快照；修订项校验在此一并完成，
     # 立即释放后不带着锁做重算
     with job.lock:
+        if job.terminated:
+            raise JobNotFoundError(job_id)
         if version != job.version:
             raise VersionConflictError(version, job.version)
         updates = _validate_demand_updates(payload.get("demands"), job.network)
@@ -549,11 +598,21 @@ def revise_demands(job_id: str, payload: Any) -> tuple[dict[str, Any], list[dict
         revised[item["node_id"]] = item["demand"]
     new_net = _network_with_demands(net, revised)
     # 锁外重算：失供节点保存新值、连通节点按新值求解，均由 _build_snapshot 完成
-    candidate = _build_snapshot(job.job_id, base_version + 1, new_net,
-                                allowed, base_closed, stage="revise")
+    try:
+        candidate = _build_snapshot(job.job_id, base_version + 1, new_net,
+                                    allowed, base_closed, stage="revise")
+    except IsolationRuleError:
+        # 与切换相同：结束时尚未提交的修订，结束后即使结果是欠压/不收敛/
+        # 聚合溢出/非有限数等失败，也统一按 404 处理，绝不返回 422 或恢复作业。
+        with job.lock:
+            if job.terminated:
+                raise JobNotFoundError(job_id) from None
+        raise
 
     # 第 2 段临界区：提交时重新比对版本——计算期间版本若已推进则丢弃本次结果
     with job.lock:
+        if job.terminated:
+            raise JobNotFoundError(job_id)
         if job.version != base_version:
             raise VersionConflictError(version, job.version)
         # 全部规则满足且求解收敛：一次性提交需水量、完整快照与版本号
